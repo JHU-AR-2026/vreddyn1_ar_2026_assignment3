@@ -1,0 +1,343 @@
+
+const MODEL_FOLDER = "https://raw.githubusercontent.com/VivekRnx/ar-models/main/";
+const MODEL_FILE = "majestic_sword.glb";
+
+const MODEL_SIZE = 0.3;      // largest side of a freshly spawned model, in meters
+const MAX_DISTANCE = 10;     // controller ray length, in meters
+const MOVE_SPEED = 0.5;      // meters per second at full right-stick deflection
+const STICK_DEADZONE = 0.15;
+const TURN_SPEED = Math.PI / 2;  // radians per second at full left-stick deflection
+const SCALE_STEP = 1.1;      // A multiplies the size by this, B divides by it
+const MIN_SCALE = 0.05;
+const MAX_SCALE = 20;
+
+export const createScene = async function () {
+    const scene = new BABYLON.Scene(engine);
+
+    // Transparent background so the Quest passthrough is visible (Lec 7).
+    scene.clearColor = new BABYLON.Color4(0, 0, 0, 0);
+
+    // Desktop camera, only used outside XR.
+    const camera = new BABYLON.FreeCamera("camera", new BABYLON.Vector3(0, 1.6, -2), scene);
+    camera.setTarget(new BABYLON.Vector3(0, 0.5, 1));
+    camera.attachControl(canvas, true);
+
+    const hemiLight = new BABYLON.HemisphericLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
+    hemiLight.intensity = 0.8;
+    const sunLight = new BABYLON.DirectionalLight("sunLight", new BABYLON.Vector3(-0.5, -1, 0.5), scene);
+    sunLight.intensity = 0.6;
+
+    // Load the model once into an AssetContainer (nothing is shown yet);
+    // every trigger press instantiates a fresh copy from it.
+    const container = await BABYLON.SceneLoader.LoadAssetContainerAsync(MODEL_FOLDER, MODEL_FILE, scene);
+
+    // Reticle that marks the current hit-test location on the real surface.
+    const reticle = BABYLON.MeshBuilder.CreateTorus("reticle",
+        { diameter: 0.12, thickness: 0.01, tessellation: 32 }, scene);
+    const reticleMaterial = new BABYLON.StandardMaterial("reticleMaterial", scene);
+    reticleMaterial.emissiveColor = new BABYLON.Color3(0.1, 1, 0.3);
+    reticleMaterial.disableLighting = true;
+    reticle.material = reticleMaterial;
+    reticle.rotationQuaternion = BABYLON.Quaternion.Identity();
+    reticle.isPickable = false;
+    reticle.setEnabled(false);
+
+    let spawnCount = 0;
+    let current = null;      // root node of the most recently spawned model (null until the first spawn)
+    let latestHit = null;    // { position } of the right controller's hit this frame, or null
+    let rightStick = null;   // right thumbstick component, once the right controller is ready
+    let leftStick = null;    // left thumbstick component, once the left controller is ready
+
+    // Returns the min/max world-space corners of everything under `node`.
+    function getHierarchyBounds(node) {
+        node.computeWorldMatrix(true);
+        node.getDescendants(false).forEach((n) => n.computeWorldMatrix && n.computeWorldMatrix(true));
+        const min = new BABYLON.Vector3(Infinity, Infinity, Infinity);
+        const max = new BABYLON.Vector3(-Infinity, -Infinity, -Infinity);
+        node.getChildMeshes(false).forEach((mesh) => {
+            if (mesh.getTotalVertices() === 0) return;
+            const box = mesh.getBoundingInfo().boundingBox;
+            min.minimizeInPlace(box.minimumWorld);
+            max.maximizeInPlace(box.maximumWorld);
+        });
+        return { min, max };
+    }
+
+    // Spawn a new copy of the model standing upright at `position`, turned to face the user.
+    //   root  : the node we move / rotate / scale (starts at scaling 1)
+    //   fit   : fixed child that rescales the model to MODEL_SIZE and puts its base on the root's origin
+    function spawnModel(position) {
+        spawnCount++;
+        const root = new BABYLON.TransformNode("model" + spawnCount, scene);
+        const fit = new BABYLON.TransformNode("model" + spawnCount + "_fit", scene);
+        fit.parent = root;
+
+        const instance = container.instantiateModelsToScene((name) => name + "_" + spawnCount, false);
+        instance.rootNodes.forEach((node) => { node.parent = fit; });
+        instance.animationGroups.forEach((group) => group.stop());
+        if (instance.animationGroups.length > 0) instance.animationGroups[0].play(true);
+        root.getChildMeshes(false).forEach((mesh) => { mesh.isPickable = false; });
+
+        // Normalize size, then center the model in x/z and drop its lowest point onto the surface.
+        const raw = getHierarchyBounds(root);
+        const size = raw.max.subtract(raw.min);
+        const fitScale = MODEL_SIZE / Math.max(size.x, size.y, size.z, 1e-6);
+        fit.scaling.setAll(fitScale);
+        const scaled = getHierarchyBounds(root);
+        fit.position.set(
+            -(scaled.min.x + scaled.max.x) / 2,
+            -scaled.min.y,
+            -(scaled.min.z + scaled.max.z) / 2
+        );
+
+        root.position.copyFrom(position);
+        // glTF models face +Z; yaw the root so that +Z points at the user (left-handed: +Z -> (sin, 0, cos)).
+        const toUser = scene.activeCamera.globalPosition.subtract(position);
+        root.rotation.y = Math.atan2(toUser.x, toUser.z);
+
+        // Remember this model's spawn pose so the X button can restore it.
+        root.metadata = {
+            initialPosition: root.position.clone(),
+            initialRotation: root.rotation.clone(),
+            initialScaling: root.scaling.clone()
+        };
+
+        current = root;
+        return root;
+    }
+
+    const xr = await scene.createDefaultXRExperienceAsync({
+        uiOptions: {
+            sessionMode: "immersive-ar",
+            referenceSpaceType: "local-floor"
+        },
+        optionalFeatures: ["hit-test"],
+        ignoreNativeCameraTransformation: true,
+        disableTeleportation: true,
+        disableNearInteraction: true,
+        disableHandTracking: true,
+        pointerSelectionOptions: {
+            enablePointerSelectionOnAllControllers: true,
+            maxPointerDistance: MAX_DISTANCE
+        }
+    });
+
+    // Keep the desktop preview working on browsers without WebXR.
+    if (!xr.baseExperience || !xr.input) {
+        return scene;
+    }
+
+    const sessionManager = xr.baseExperience.sessionManager;
+
+    // Show the controller laser (the "controller ray") but never select anything with it;
+    // the trigger is handled by our own hit-test code below.
+    if (xr.pointerSelection) {
+        xr.pointerSelection.raySelectionPredicate = () => false;
+        xr.pointerSelection.displayLaserPointer = true;
+        xr.pointerSelection.displaySelectionMesh = false;
+    }
+
+    xr.baseExperience.onStateChangedObservable.add((state) => {
+        if (state !== BABYLON.WebXRState.IN_XR) {
+            reticle.setEnabled(false);
+            latestHit = null;
+        }
+    });
+
+    // Hit-test state for the right controller.
+    let rightController = null;
+    let hitTestSource = null;
+    let hitTestUnavailable = false;   // true when the browser/emulator has no hit-test support
+    const pointerRay = new BABYLON.Ray(BABYLON.Vector3.Zero(), BABYLON.Vector3.Forward(), MAX_DISTANCE);
+
+    xr.input.onControllerAddedObservable.add((controller) => {
+        const hand = controller.inputSource.handedness;
+
+        if (hand === "right") {
+            rightController = controller;
+            let disposed = false;
+            controller.onDisposeObservable.addOnce(() => {
+                disposed = true;
+                if (rightController === controller) rightController = null;
+                if (hitTestSource) hitTestSource.cancel();
+                hitTestSource = null;
+            });
+
+            // Native WebXR hit test that follows this controller's ray.
+            const session = sessionManager.session;
+            if (session && session.requestHitTestSource) {
+                session.requestHitTestSource({ space: controller.inputSource.targetRaySpace })
+                    .then((source) => {
+                        if (disposed) source.cancel();
+                        else hitTestSource = source;
+                    })
+                    .catch((error) => {
+                        console.warn("Controller hit test unavailable:", error);
+                        hitTestUnavailable = true;
+                    });
+            } else {
+                console.warn("WebXR hit test is not supported on this device.");
+                hitTestUnavailable = true;
+            }
+        }
+
+        controller.onMotionControllerInitObservable.add((motionController) => {
+            if (hand === "right") {
+                // Right trigger: spawn a new model at the current hit-test location.
+                const trigger = motionController.getComponent("xr-standard-trigger");
+                if (trigger) {
+                    trigger.onButtonStateChangedObservable.add(() => {
+                        // Act once per press, not on every analog value change.
+                        if (!trigger.changes.pressed || !trigger.pressed) return;
+                        if (xr.baseExperience.state !== BABYLON.WebXRState.IN_XR) return;
+                        if (!latestHit) return;   // ray is not hitting a real surface
+                        spawnModel(latestHit.position);
+                    });
+                }
+
+                // Right thumbstick: read every frame in the render loop below.
+                const stick = motionController.getComponent("xr-standard-thumbstick");
+                if (stick) {
+                    rightStick = stick;
+                    controller.onDisposeObservable.addOnce(() => {
+                        if (rightStick === stick) rightStick = null;
+                    });
+                }
+
+                // A button: grow the most recent model; B button: shrink it (uniform on all 3 axes).
+                const aButton = motionController.getComponent("a-button");
+                if (aButton) {
+                    aButton.onButtonStateChangedObservable.add(() => {
+                        if (aButton.changes.pressed && aButton.pressed) scaleCurrent(SCALE_STEP);
+                    });
+                }
+                const bButton = motionController.getComponent("b-button");
+                if (bButton) {
+                    bButton.onButtonStateChangedObservable.add(() => {
+                        if (bButton.changes.pressed && bButton.pressed) scaleCurrent(1 / SCALE_STEP);
+                    });
+                }
+            }
+
+            if (hand === "left") {
+                // Left thumbstick: read every frame in the render loop below.
+                const stick = motionController.getComponent("xr-standard-thumbstick");
+                if (stick) {
+                    leftStick = stick;
+                    controller.onDisposeObservable.addOnce(() => {
+                        if (leftStick === stick) leftStick = null;
+                    });
+                }
+
+                // X button: restore the most recent model to its spawn pose.
+                const xButton = motionController.getComponent("x-button");
+                if (xButton) {
+                    xButton.onButtonStateChangedObservable.add(() => {
+                        if (xButton.changes.pressed && xButton.pressed) resetCurrent();
+                    });
+                }
+            }
+        });
+    });
+
+    // Every XR frame: query the controller hit test and move the reticle to the hit.
+    sessionManager.onXRFrameObservable.add((frame) => {
+        latestHit = null;
+        if (!rightController) {
+            reticle.setEnabled(false);
+            return;
+        }
+
+        if (hitTestSource) {
+            const hit = frame.getHitTestResults(hitTestSource)[0];
+            const pose = hit && hit.getPose(sessionManager.referenceSpace);
+            if (pose) {
+                // Convert WebXR's right-handed pose into Babylon's left-handed frame (as in #C35KZV).
+                const matrix = BABYLON.Matrix.FromArray(pose.transform.matrix);
+                if (!scene.useRightHandedSystem) {
+                    matrix.toggleModelMatrixHandInPlace();
+                }
+                const position = matrix.getTranslation().scaleInPlace(sessionManager.worldScalingFactor);
+                rightController.getWorldPointerRayToRef(pointerRay);
+                if (BABYLON.Vector3.Distance(pointerRay.origin, position) <= MAX_DISTANCE) {
+                    latestHit = { position };
+                    reticle.position.copyFrom(position);
+                    // The hit pose's +Y axis is the surface normal; the torus lies in its XZ plane.
+                    BABYLON.Quaternion.FromRotationMatrixToRef(matrix, reticle.rotationQuaternion);
+                }
+            }
+        } else if (hitTestUnavailable) {
+            // Fallback for the desktop WebXR emulator only: intersect the controller ray
+            // with the virtual floor (y = 0 in local-floor space).
+            rightController.getWorldPointerRayToRef(pointerRay);
+            const dir = pointerRay.direction;
+            if (dir.y < -1e-3) {
+                const t = -pointerRay.origin.y / dir.y;
+                if (t <= MAX_DISTANCE) {
+                    const position = pointerRay.origin.add(dir.scale(t));
+                    latestHit = { position };
+                    reticle.position.copyFrom(position);
+                    reticle.rotationQuaternion.copyFrom(BABYLON.Quaternion.Identity());
+                }
+            }
+        }
+
+        reticle.setEnabled(latestHit !== null);
+    });
+
+    // ---- Q2.c: move the most recent model on the horizontal plane with the right thumbstick ----
+
+    // Thumbstick axes with a small deadzone so a resting stick does not drift.
+    function readStick(stick) {
+        const x = Math.abs(stick.axes.x) > STICK_DEADZONE ? stick.axes.x : 0;
+        const y = Math.abs(stick.axes.y) > STICK_DEADZONE ? stick.axes.y : 0;
+        return { x, y };
+    }
+
+    scene.onBeforeRenderObservable.add(() => {
+        if (!current || !rightStick) return;
+        const { x, y } = readStick(rightStick);
+        if (x === 0 && y === 0) return;
+
+        // Move relative to where the user is looking, flattened onto the XZ plane, so
+        // "stick forward" pushes the model away from the user. WebXR reports forward as y < 0.
+        const cam = scene.activeCamera;
+        const forward = cam.getDirection(BABYLON.Axis.Z);
+        forward.y = 0;
+        if (forward.lengthSquared() < 1e-6) return;   // looking straight up or down
+        forward.normalize();
+        const right = BABYLON.Vector3.Cross(BABYLON.Axis.Y, forward);   // left-handed: Y x Z = X
+
+        const step = MOVE_SPEED * engine.getDeltaTime() / 1000;
+        current.position.addInPlace(right.scale(x * step));
+        current.position.addInPlace(forward.scale(-y * step));
+        // y (height) is untouched: the model stays on its horizontal plane.
+    });
+
+    // ---- Q2.d: rotate the most recent model about the vertical y-axis with the left thumbstick ----
+
+    scene.onBeforeRenderObservable.add(() => {
+        if (!current || !leftStick) return;
+        const { x } = readStick(leftStick);
+        if (x === 0) return;
+        // Stick right turns the model clockwise as seen from above (positive yaw in Babylon).
+        current.rotation.y += x * TURN_SPEED * engine.getDeltaTime() / 1000;
+    });
+
+    // ---- Q2.e: uniform scaling of the most recent model ----
+    function scaleCurrent(factor) {
+        if (!current) return;   // no model spawned yet: ignore the press
+        const s = BABYLON.Scalar.Clamp(current.scaling.x * factor, MIN_SCALE, MAX_SCALE);
+        current.scaling.setAll(s);   // same factor on x, y and z
+    }
+
+    // ---- Q2.f: reset the most recent model to its spawn pose; older models are left alone ----
+    function resetCurrent() {
+        if (!current || !current.metadata) return;   // no model spawned yet: ignore the press
+        current.position.copyFrom(current.metadata.initialPosition);
+        current.rotation.copyFrom(current.metadata.initialRotation);
+        current.scaling.copyFrom(current.metadata.initialScaling);
+    }
+
+    return scene;
+};
